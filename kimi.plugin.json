@@ -1,0 +1,20 @@
+{
+  "name": "kimi-codex-oauth",
+  "version": "0.1.0",
+  "description": "Reuse the local ChatGPT OAuth login (from Codex CLI, ~/.codex/auth.json) to call GPT models from Kimi Code via a local proxy.",
+  "keywords": ["openai", "chatgpt", "codex", "oauth", "gpt-5"],
+  "license": "MIT",
+  "commands": "./commands/",
+  "skills": "./skills/",
+  "hooks": [
+    {
+      "event": "SessionStart",
+      "command": "node ./bin/ensure-proxy.mjs && node ./bin/sync-models.mjs",
+      "timeout": 30
+    }
+  ],
+  "interface": {
+    "displayName": "Kimi Codex OAuth",
+    "shortDescription": "Reuse ChatGPT OAuth login (Codex CLI) to use GPT models in Kimi Code"
+  }
+}

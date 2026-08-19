@@ -30,6 +30,7 @@ const out = fs.openSync(LOG_PATH, 'a');
 const child = spawn(process.execPath, [PROXY], {
   detached: true,
   stdio: ['ignore', out, out],
+  windowsHide: true, // no console window flash when spawned on Windows
 });
 child.unref();
 fs.closeSync(out);

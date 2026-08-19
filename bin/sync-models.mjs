@@ -45,16 +45,20 @@ const SLUG_RE = /^[a-z0-9][a-z0-9._-]*$/i;
 // Primary: `kimi doctor` against a sandboxed KIMI_CODE_HOME (the same strict
 // checks the CLI itself applies). Fallback: python3 tomllib. If neither
 // validator exists, accept. Returns null when valid, an error string when not.
+// On Windows the CLI binary is kimi.cmd / kimi.exe, so try several names.
+const KIMI_BIN_NAMES = process.platform === 'win32' ? ['kimi.cmd', 'kimi.exe', 'kimi'] : ['kimi'];
+
 function validateConfig(content) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimi-codex-oauth-'));
   try {
     fs.writeFileSync(path.join(tmpDir, 'config.toml'), content);
-    const doctor = spawnSync('kimi', ['doctor'], {
-      env: { ...process.env, KIMI_CODE_HOME: tmpDir },
-      timeout: 20000,
-      encoding: 'utf8',
-    });
-    if (!doctor.error) {
+    for (const bin of KIMI_BIN_NAMES) {
+      const doctor = spawnSync(bin, ['doctor'], {
+        env: { ...process.env, KIMI_CODE_HOME: tmpDir },
+        timeout: 20000,
+        encoding: 'utf8',
+      });
+      if (doctor.error) continue; // binary not found under this name
       if (doctor.status === 0) return null;
       return `kimi doctor: ${`${doctor.stdout}\n${doctor.stderr}`.trim().slice(0, 300)}`;
     }

@@ -18,7 +18,7 @@ Kimi Code ──> http://127.0.0.1:8317/v1/responses (本地代理)
 
 ## 安装
 
-前置条件：已安装 Codex CLI 并完成 `codex login`(ChatGPT 账号登录）,`~/.codex/auth.json` 存在。
+前置条件：已安装 Codex CLI 并完成 `codex login`(ChatGPT 账号登录）,`~/.codex/auth.json` 存在；Node.js >= 18。macOS / Linux / Windows 均可。
 
 在 Kimi Code 中：
 
@@ -53,7 +53,7 @@ setup 命令会：检查环境 → 启动代理 → 向 `~/.kimi-code/config.tom
 /plugins remove kimi-codex-oauth
 ```
 
-并手动删除 `~/.kimi-code/config.toml` 中的 `[providers.chatgpt-oauth]` 和所有 `[models."chatgpt/..."]` 段落；停掉代理进程（`pkill -f codex-oauth-proxy`)。
+并手动删除 `~/.kimi-code/config.toml` 中的 `[providers.chatgpt-oauth]` 和所有 `[models."chatgpt/..."]` 段落；停掉代理进程（macOS/Linux: `pkill -f codex-oauth-proxy`;Windows PowerShell: `Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Object CommandLine -match 'codex-oauth-proxy' | ForEach-Object { Stop-Process -Id $_.ProcessId }`)。
 
 ## 合规提示
 

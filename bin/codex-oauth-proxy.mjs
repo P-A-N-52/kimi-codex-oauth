@@ -15,6 +15,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { Readable } from 'node:stream';
+import { pathToFileURL } from 'node:url';
+import { writePrivateAtomic } from './private-file.mjs';
+import { SERVICE, VERSION, statePath, shutdownPath, registerProxy, removeProxyState, shutdownAuthorized } from './proxy-control.mjs';
 
 const PORT = Number(process.env.CODEX_OAUTH_PORT || 8317);
 const HOST = '127.0.0.1';
@@ -56,7 +59,9 @@ async function getModels() {
       signal: AbortSignal.timeout(10000),
     });
     if (res.ok) {
-      const data = await res.json();
+      let data;
+      try { data = await res.json(); }
+      catch { throw new Error('models endpoint returned invalid JSON'); }
       const models = (data.models ?? []).filter((m) => m && m.slug);
       if (models.length > 0) {
         modelsCache = { at: Date.now(), models, live: true };
@@ -77,7 +82,11 @@ function log(msg) {
 }
 
 function readAuth() {
-  return JSON.parse(fs.readFileSync(AUTH_PATH, 'utf8'));
+  let content;
+  try { content = fs.readFileSync(AUTH_PATH, 'utf8'); }
+  catch { throw new Error('cannot read Codex login cache; check CODEX_AUTH_PATH and codex login'); }
+  try { return JSON.parse(content); }
+  catch { throw new Error('Codex login cache contains invalid JSON; run codex login'); }
 }
 
 function jwtExp(token) {
@@ -91,10 +100,14 @@ function jwtExp(token) {
   }
 }
 
-function writeAuthAtomic(next) {
-  const tmp = AUTH_PATH + '.tmp-' + process.pid;
-  fs.writeFileSync(tmp, JSON.stringify(next, null, 2));
-  fs.renameSync(tmp, AUTH_PATH);
+function writeAuthAtomic(next, expected) {
+  writePrivateAtomic(AUTH_PATH, JSON.stringify(next, null, 2), {
+    beforeRename: () => {
+      if (JSON.stringify(readAuth()) !== JSON.stringify(expected)) {
+        throw new Error('Codex login changed during refresh; retry the request');
+      }
+    },
+  });
 }
 
 let refreshPromise = null;
@@ -109,16 +122,24 @@ async function refreshTokens(usedAuth) {
       grant_type: 'refresh_token',
       refresh_token: usedAuth.tokens.refresh_token,
     }),
+    signal: AbortSignal.timeout(15000),
   });
   if (!res.ok) {
-    const text = (await res.text()).slice(0, 500);
-    throw new Error(`token refresh failed: HTTP ${res.status} ${text}`);
+    throw new Error('token refresh failed: HTTP ' + res.status + '; run "codex login" if the login expired');
   }
-  const data = await res.json();
-  if (!data.access_token) throw new Error('token refresh returned no access_token');
+  let data;
+  try { data = await res.json(); }
+  catch { throw new Error('token refresh returned invalid JSON'); }
+  if (!data || typeof data.access_token !== 'string' || !data.access_token) {
+    throw new Error('token refresh returned no access_token');
+  }
 
   // Merge against the on-disk file: Codex CLI may have refreshed concurrently.
   const current = readAuth();
+  if (!current.tokens?.access_token || current.auth_mode !== usedAuth.auth_mode ||
+      current.tokens.account_id !== usedAuth.tokens.account_id) {
+    throw new Error('Codex login changed during refresh; retry the request');
+  }
   if (
     current.tokens?.access_token &&
     current.tokens.access_token !== usedAuth.tokens.access_token
@@ -130,6 +151,9 @@ async function refreshTokens(usedAuth) {
     }
   }
 
+  if (current.tokens.refresh_token !== usedAuth.tokens.refresh_token) {
+    throw new Error('Codex login changed during refresh; retry the request');
+  }
   const next = {
     ...current,
     tokens: {
@@ -140,7 +164,7 @@ async function refreshTokens(usedAuth) {
     },
     last_refresh: new Date().toISOString(),
   };
-  writeAuthAtomic(next);
+  writeAuthAtomic(next, current);
   log('access token refreshed and written back');
   return next;
 }
@@ -238,7 +262,7 @@ async function handleResponses(req, res) {
     const upstream = await forwardResponses(body);
     if (!upstream.ok) {
       const text = (await upstream.text()).slice(0, 2000);
-      log(`upstream error: HTTP ${upstream.status} ${text.slice(0, 300)}`);
+      log('upstream error: HTTP ' + upstream.status);
       res.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') ?? 'application/json' });
       return res.end(text);
     }
@@ -253,8 +277,11 @@ async function handleResponses(req, res) {
   }
 }
 
-function handleHealthz(_req, res) {
-  const info = { ok: true, port: PORT, auth_file: AUTH_PATH };
+function handleHealthz(_req, res, state) {
+  const info = {
+    ok: true, port: state?.port ?? PORT, auth_file: AUTH_PATH,
+    service: SERVICE, version: VERSION, pid: process.pid, instance_id: state?.instanceId,
+  };
   try {
     const auth = readAuth();
     const exp = jwtExp(auth.tokens?.access_token ?? '');
@@ -274,34 +301,66 @@ function handleHealthz(_req, res) {
   sendJson(res, info.ok ? 200 : 500, info);
 }
 
-const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, `http://${HOST}:${PORT}`);
-  if (req.method === 'POST' && (url.pathname === '/v1/responses' || url.pathname === '/responses')) {
-    return void handleResponses(req, res);
-  }
-  if (req.method === 'GET' && (url.pathname === '/v1/models' || url.pathname === '/models')) {
-    const { models, live } = await getModels();
-    let authMode = 'missing';
+export function createProxyServer() {
+  let state;
+  let instanceFile;
+  const server = http.createServer(async (req, res) => {
+    const url = new URL(req.url, `http://${HOST}:${PORT}`);
+    if (req.method === 'POST' && url.pathname === shutdownPath) {
+      if (!shutdownAuthorized(req.headers.authorization, state)) {
+        return sendJson(res, 403, { error: 'invalid control token' });
+      }
+      res.on('finish', () => { server.close(); server.closeAllConnections(); });
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+    if (req.method === 'POST' && (url.pathname === '/v1/responses' || url.pathname === '/responses')) {
+      return void handleResponses(req, res);
+    }
+    if (req.method === 'GET' && (url.pathname === '/v1/models' || url.pathname === '/models')) {
+      const { models, live } = await getModels();
+      let authMode = 'missing';
+      try {
+        const auth = readAuth();
+        authMode = auth.tokens?.access_token
+          ? 'chatgpt'
+          : (auth.OPENAI_API_KEY || auth.auth_mode === 'apikey' ? 'apikey' : 'missing');
+      } catch { /* keep 'missing' */ }
+      return sendJson(res, 200, {
+        object: 'list',
+        live,
+        auth_mode: authMode,
+        data: models.map((m) => ({ ...m, id: m.slug, object: 'model', created: 0, owned_by: 'chatgpt-oauth' })),
+      });
+    }
+    if (req.method === 'GET' && url.pathname === '/healthz') {
+      return void handleHealthz(req, res, state);
+    }
+    sendJson(res, 404, { error: { message: `not found: ${req.method} ${url.pathname}` } });
+  });
+  server.on('listening', () => {
+    const port = server.address().port;
+    instanceFile = statePath(LOG_PATH, port);
     try {
-      const auth = readAuth();
-      authMode = auth.tokens?.access_token
-        ? 'chatgpt'
-        : (auth.OPENAI_API_KEY || auth.auth_mode === 'apikey' ? 'apikey' : 'missing');
-    } catch { /* keep 'missing' */ }
-    return sendJson(res, 200, {
-      object: 'list',
-      live,
-      auth_mode: authMode,
-      data: models.map((m) => ({ ...m, id: m.slug, object: 'model', created: 0, owned_by: 'chatgpt-oauth' })),
-    });
-  }
-  if (req.method === 'GET' && url.pathname === '/healthz') {
-    return void handleHealthz(req, res);
-  }
-  sendJson(res, 404, { error: { message: `not found: ${req.method} ${url.pathname}` } });
-});
+      state = registerProxy(instanceFile, port, fs.existsSync(AUTH_PATH) ? AUTH_PATH : undefined);
+    } catch (e) {
+      server.close();
+      server.emit('error', e);
+      return;
+    }
+    log('codex-oauth-proxy listening on http://' + HOST + ':' + port);
+  });
+  server.on('close', () => {
+    if (state) removeProxyState(instanceFile, state.instanceId);
+  });
+  return server;
+}
 
-server.listen(PORT, HOST, () => {
-  log(`codex-oauth-proxy listening on http://${HOST}:${PORT}`);
-  console.log(`codex-oauth-proxy listening on http://${HOST}:${PORT} (log: ${LOG_PATH})`);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+  const server = createProxyServer();
+  server.on('error', (e) => { console.error('codex-oauth-proxy: ' + e.message); process.exitCode = 1; });
+  for (const signal of ['SIGINT', 'SIGTERM']) {
+    process.on(signal, () => { server.close(); server.closeAllConnections(); });
+  }
+  server.listen(PORT, HOST);
+}

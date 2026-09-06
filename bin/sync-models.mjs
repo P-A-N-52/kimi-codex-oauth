@@ -20,12 +20,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { spawnSync } from 'node:child_process';
+import { MARKER, sections, tomlLines, writeConfig } from './config-file.mjs';
 
 const PORT = Number(process.env.CODEX_OAUTH_PORT || 8317);
 const KIMI_HOME = process.env.KIMI_CODE_HOME || path.join(os.homedir(), '.kimi-code');
 const CONFIG_PATH = path.join(KIMI_HOME, 'config.toml');
-const MARKER = '# managed-by: kimi-codex-oauth';
 
 // Values accepted on the wire as reasoning.effort (verified against the
 // backend: it rejects e.g. "ultra", which the models endpoint lists but which
@@ -40,39 +39,6 @@ function wireEfforts(m) {
 
 // Only slugs that are safe inside a quoted TOML table header.
 const SLUG_RE = /^[a-z0-9][a-z0-9._-]*$/i;
-
-// Validate candidate config content before it touches the real config.toml.
-// Primary: `kimi doctor` against a sandboxed KIMI_CODE_HOME (the same strict
-// checks the CLI itself applies). Fallback: python3 tomllib. If neither
-// validator exists, accept. Returns null when valid, an error string when not.
-// On Windows the CLI binary is kimi.cmd / kimi.exe, so try several names.
-const KIMI_BIN_NAMES = process.platform === 'win32' ? ['kimi.cmd', 'kimi.exe', 'kimi'] : ['kimi'];
-
-function validateConfig(content) {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimi-codex-oauth-'));
-  try {
-    fs.writeFileSync(path.join(tmpDir, 'config.toml'), content);
-    for (const bin of KIMI_BIN_NAMES) {
-      const doctor = spawnSync(bin, ['doctor'], {
-        env: { ...process.env, KIMI_CODE_HOME: tmpDir },
-        timeout: 20000,
-        encoding: 'utf8',
-      });
-      if (doctor.error) continue; // binary not found under this name
-      if (doctor.status === 0) return null;
-      return `kimi doctor: ${`${doctor.stdout}\n${doctor.stderr}`.trim().slice(0, 300)}`;
-    }
-    const py = spawnSync(
-      'python3',
-      ['-c', 'import sys,tomllib;tomllib.load(open(sys.argv[1],"rb"))', path.join(tmpDir, 'config.toml')],
-      { timeout: 10000, encoding: 'utf8' },
-    );
-    if (py.error || (py.stderr ?? '').includes('No module named')) return null;
-    return py.status === 0 ? null : `TOML parse error: ${(py.stderr ?? '').trim().slice(0, 200)}`;
-  } finally {
-    fs.rmSync(tmpDir, { recursive: true, force: true });
-  }
-}
 
 const PROVIDER_HEADER = '[providers.chatgpt-oauth]';
 const PROVIDER_FIELDS = {
@@ -127,9 +93,11 @@ function blockFromFields(header, fields) {
 // Returns { body, changed }.
 function reconcileBody(body, fields) {
   const lines = body.split('\n');
+  const topLevel = tomlLines(body).map((line) => line.topLevel);
   let changed = false;
   const seen = new Set();
   for (let i = 0; i < lines.length; i++) {
+    if (!topLevel[i]) continue;
     const m = lines[i].match(/^([a-z_]+)\s*=\s*(.*)$/);
     if (!m) continue;
     const [, key, value] = m;
@@ -143,7 +111,7 @@ function reconcileBody(body, fields) {
   // Insert managed fields that are missing entirely (e.g. deleted by accident).
   const missing = Object.entries(fields).filter(([k]) => !seen.has(k));
   if (missing.length) {
-    const insertAt = lines.findIndex((l) => l.trim() === MARKER);
+    const insertAt = lines.findIndex((l, i) => topLevel[i] && l.trim() === MARKER);
     const at = insertAt >= 0 ? insertAt + 1 : 0;
     lines.splice(at, 0, ...missing.map(([k, v]) => `${k} = ${v}`));
     changed = true;
@@ -170,15 +138,22 @@ try {
   }
   const bySlug = new Map(models.map((m) => [m.slug ?? m.id, m]));
 
-  const config = fs.readFileSync(CONFIG_PATH, 'utf8');
+  const original = fs.readFileSync(CONFIG_PATH, 'utf8');
+  const config = original.replace(/\r\n/g, '\n');
+  const blocks = sections(config);
   const existing = new Set(
-    [...config.matchAll(/^\[models\."chatgpt\/([^"]+)"\]$/gm)].map((m) => m[1]),
+    blocks.flatMap((block) => block.header.match(/^\[models\."chatgpt\/([^"]+)"\]$/)?.slice(1) ?? []),
   );
-  // Aliases referenced as default models must never be deleted — removing
-  // them would make the whole config fail Kimi's startup validation.
+  // Preserve any alias referenced elsewhere, including defaults, secondary
+  // pools, personal overrides and conservatively even references in comments.
   const referenced = new Set();
-  for (const m of config.matchAll(/default_model\s*=\s*"chatgpt\/([^"]+)"/g)) referenced.add(m[1]);
-  for (const m of config.matchAll(/^\s*"chatgpt\/([^"]+)"\s*=/gm)) referenced.add(m[1]);
+  for (const block of blocks) {
+    const model = block.header.match(/^\[models\."chatgpt\/([^"]+)"\]$/);
+    if (!model) continue;
+    const alias = 'chatgpt/' + model[1];
+    const other = config.slice(0, block.start) + config.slice(block.end);
+    if (other.includes('"' + alias + '"') || other.includes("'" + alias + "'")) referenced.add(model[1]);
+  }
 
   let out = config;
   const added = [];
@@ -189,20 +164,18 @@ try {
   // 1) Reconcile managed blocks: repair drift, delete stale entries.
   //    "Stale" = slug gone from upstream (chatgpt auth) or login switched to
   //    API key (then every managed chatgpt entry is unusable).
-  const headerRe = /^\[(?:models\."chatgpt\/[^"]+"|providers\.chatgpt-oauth)\]$/gm;
-  const headers = [...config.matchAll(headerRe)];
+  const headerRe = /^\[(?:models\."chatgpt\/[^"]+"|providers\.chatgpt-oauth)\]$/;
+  const headers = blocks.filter((section) => headerRe.test(section.header));
   for (let i = headers.length - 1; i >= 0; i--) {
-    const start = headers[i].index;
-    const header = headers[i][0];
-    const nextHeader = out.indexOf('\n[', start + header.length);
-    const end = nextHeader === -1 ? out.length : nextHeader + 1;
-    const body = out.slice(start + header.length, end);
-    if (!body.includes(MARKER)) continue; // user-owned — hands off
+    const { start, end, header, managed, text } = headers[i];
+    const bodyStart = start + text.match(/^[^\n]*(?:\n|$)/)[0].length;
+    const body = out.slice(bodyStart, end);
+    if (!managed) continue; // user-owned — hands off
     if (header === PROVIDER_HEADER) {
       if (authMode === 'chatgpt') {
         const { body: fixed, changed } = reconcileBody(body, PROVIDER_FIELDS);
         if (changed) {
-          out = out.slice(0, start + header.length) + fixed + out.slice(end);
+          out = out.slice(0, bodyStart) + fixed + out.slice(end);
           repaired.push(header);
         }
       }
@@ -212,40 +185,34 @@ try {
     const stale = authMode === 'apikey' || !bySlug.has(slug);
     if (stale) {
       if (referenced.has(slug)) {
-        keptReferenced.push(slug); // in use as a default model — keep, but warn
+        keptReferenced.push(slug);
         continue;
       }
-      out = (out.slice(0, start) + out.slice(end)).replace(/\n{3,}/g, '\n\n');
+      out = out.slice(0, start) + out.slice(end);
       removed.push(slug);
       continue;
     }
     const { body: fixed, changed } = reconcileBody(body, modelFields(bySlug.get(slug)));
     if (changed) {
-      out = out.slice(0, start + header.length) + fixed + out.slice(end);
+      out = out.slice(0, bodyStart) + fixed + out.slice(end);
       repaired.push(header);
     }
   }
 
   // 2) Provider block cleanup/addition.
-  const anyModelLeft = /^\[models\."chatgpt\//m.test(out);
-  const providerPresent = new RegExp(`^\\${PROVIDER_HEADER}$`, 'm').test(out);
-  if (authMode === 'apikey' && providerPresent && !anyModelLeft) {
-    // No chatgpt models remain (or only user-owned ones reference their own
-    // providers) — remove the managed provider block if it is managed.
-    const m = out.match(new RegExp(`^\\${PROVIDER_HEADER}$`, 'm'));
-    const start = m.index;
-    const nextHeader = out.indexOf('\n[', start + PROVIDER_HEADER.length);
-    const end = nextHeader === -1 ? out.length : nextHeader + 1;
-    if (out.slice(start, end).includes(MARKER)) {
-      out = (out.slice(0, start) + out.slice(end)).replace(/\n{3,}/g, '\n\n');
-      removed.push('(provider)');
-    }
+  const remaining = sections(out);
+  const provider = remaining.find((block) => block.header === PROVIDER_HEADER);
+  const providerReferenced = remaining.some((block) =>
+    block.header !== PROVIDER_HEADER && block.text.includes('chatgpt-oauth'));
+  if (authMode === 'apikey' && provider?.managed && !providerReferenced) {
+    out = out.slice(0, provider.start) + out.slice(provider.end);
+    removed.push('(provider)');
   }
 
   // 3) Add missing entries (chatgpt auth only; provider first, then models).
   if (authMode === 'chatgpt') {
     let addition = '';
-    if (!new RegExp(`^\\${PROVIDER_HEADER}$`, 'm').test(out)) {
+    if (!remaining.some((block) => /^\[providers\.(?:chatgpt-oauth|"chatgpt-oauth"|'chatgpt-oauth')\]$/.test(block.header))) {
       addition += blockFromFields(PROVIDER_HEADER, PROVIDER_FIELDS);
     }
     for (const m of models) {
@@ -258,28 +225,23 @@ try {
     if (addition) out = out.trimEnd() + '\n' + addition;
   }
 
+  if (keptReferenced.length) {
+    console.error(
+      'kimi-codex-oauth: kept stale aliases still referenced in user configuration: ' +
+      keptReferenced.map((s) => 'chatgpt/' + s).join(', ') +
+      ' — remove their defaults, secondary entries or personal references before cleanup',
+    );
+  }
   if (out === config) process.exit(0);
   // Never write a config that Kimi Code itself would reject.
-  const invalid = validateConfig(out);
-  if (invalid) {
-    console.error(`kimi-codex-oauth sync-models: refusing to write config.toml (${invalid})`);
-    process.exit(0);
-  }
-  const tmp = CONFIG_PATH + '.tmp-' + process.pid;
-  fs.writeFileSync(tmp, out);
-  fs.renameSync(tmp, CONFIG_PATH);
+  if (original.includes('\r\n')) out = out.replace(/\n/g, '\r\n');
+  const backup = writeConfig(CONFIG_PATH, original, out);
+  console.log('kimi-codex-oauth: previous configuration saved to ' + backup);
   const parts = [];
   if (added.length) parts.push(`added: ${added.map((s) => 'chatgpt/' + s).join(', ')}`);
   if (repaired.length) parts.push(`repaired: ${repaired.join(', ')}`);
   if (removed.length) parts.push(`removed: ${removed.map((s) => (s.startsWith('(') ? s : 'chatgpt/' + s)).join(', ')}`);
   console.log('kimi-codex-oauth: config.toml updated (' + parts.join('; ') + ')');
-  if (keptReferenced.length) {
-    console.error(
-      `kimi-codex-oauth: kept stale aliases still referenced as default models: ` +
-      keptReferenced.map((s) => 'chatgpt/' + s).join(', ') +
-      ' — switch default_model / secondary_model away from them to allow cleanup',
-    );
-  }
 } catch (e) {
   console.error(`kimi-codex-oauth sync-models: ${e.message}`);
 }

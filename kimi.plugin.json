@@ -1,9 +1,11 @@
 {
   "name": "kimi-codex-oauth",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Reuse the local ChatGPT OAuth login (from Codex CLI, ~/.codex/auth.json) to call GPT models from Kimi Code via a local proxy.",
   "keywords": ["openai", "chatgpt", "codex", "oauth", "gpt-5"],
   "license": "MIT",
+  "author": "P-A-N-52",
+  "homepage": "https://github.com/P-A-N-52/kimi-codex-oauth",
   "commands": "./commands/",
   "skills": "./skills/",
   "hooks": [
@@ -15,6 +17,9 @@
   ],
   "interface": {
     "displayName": "Kimi Codex OAuth",
-    "shortDescription": "Reuse ChatGPT OAuth login (Codex CLI) to use GPT models in Kimi Code"
+    "shortDescription": "Reuse ChatGPT OAuth login (Codex CLI) to use GPT models in Kimi Code",
+    "longDescription": "Local, zero-dependency Node.js bridge for Kimi Code. Reuses Codex CLI file-based ChatGPT login, refreshes tokens, synchronizes model metadata, and provides validated configuration updates and reversible cleanup. Requires Node.js 18+ and a local Codex OAuth auth.json. See the repository for data handling, supported environments, and upgrade instructions.",
+    "developerName": "P-A-N-52",
+    "websiteURL": "https://github.com/P-A-N-52/kimi-codex-oauth"
   }
 }

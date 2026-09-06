@@ -1,13 +1,13 @@
 ---
-description: 检查 ChatGPT OAuth 代理与登录态的健康状况
+description: 检查 ChatGPT OAuth 代理、版本与登录状态
 ---
 
-检查 kimi-codex-oauth 的运行状态并向用户汇报：
+检查 kimi-codex-oauth 并报告实际结果：
 
-1. `curl -s http://127.0.0.1:8317/healthz` —— 看代理是否在运行、token 还有多久过期（`access_token_expires_in_s`)、`last_refresh` 时间。不通则先运行 `node "$KIMI_PLUGIN_ROOT/bin/ensure-proxy.mjs"` 启动代理再重试。
-2. 若 `access_token_expires_in_s` 很小或为 null，发一个最小请求触发刷新并确认成功：
-   `curl -sN -X POST http://127.0.0.1:8317/v1/responses -H 'content-type: application/json' -d '{"model":"gpt-5.6-luna","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"say ok"}]}]}' | head -c 400`
-3. 若 `healthz` 显示 `has_tokens: false` 且带有 `hint`(API-key 登录），说明用户用的是 API key 而不是 ChatGPT 订阅登录：告诉用户本插件不适用，建议直接在 `~/.kimi-code/config.toml` 配一个标准 `openai_responses` provider（`api_key` 填 API key,`base_url` 用默认 `https://api.openai.com/v1`)，并询问是否要帮忙配置。若出现 401 且刷新也失败，说明登录态已失效：提醒用户重新运行 `codex login`（或删除 `~/.codex/auth.json` 后重登）。
-4. 需要更多细节时查看日志尾部：`tail -20 ~/.codex/oauth-proxy.log`(Windows PowerShell 用 `Get-Content ~\.codex\oauth-proxy.log -Tail 20`)。
+1. 根据环境变量与 README 默认值确定端口、登录缓存和日志路径。获取 `/healthz`，检查 `service`、`version`、`has_tokens`、`has_account_id`、`access_token_expires_in_s` 和 `last_refresh`。不要读取或展示 token、实例停止密钥或完整配置。
+2. 代理不在运行时，可运行插件目录中的 `bin/ensure-proxy.mjs`。若端口已由旧版本或身份未知的进程使用，按 README 核对具体进程；不要批量终止 Node.js。升级后健康响应须显示新的版本。
+3. 若登录方式是 API key，说明此插件不适用，建议使用普通 provider。若刷新失败，引导用户 `codex login`；不要主动删除其登录缓存。
+4. 用户要求验证可用性时，从实际模型列表选择别名，执行一次短提示词请求。报告是否真的成功；缓存文件可读、token 未过期和真实模型调用成功是不同状态。
+5. 排障只读取必要的日志尾部并脱敏。日志默认 `~/.codex/oauth-proxy.log`；macOS/Linux 可用 `tail`，PowerShell 可用 `Get-Content -Tail`。不上传登录缓存、实例状态或配置备份。
 
-汇报：代理是否运行、token 剩余有效期、最近一次刷新时间、测试请求是否成功。
+报告：进程/版本、认证模式、凭据有效期、最近刷新时间，以及真实请求是否进行、是否成功。

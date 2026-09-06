@@ -1,26 +1,29 @@
 ---
 name: using-codex-oauth
-description: 在 Kimi Code 中复用本机 ChatGPT(Codex CLI) OAuth 登录使用 GPT 模型的使用说明与排障。当用户询问 chatgpt/gpt-5 模型、codex-oauth 代理、或相关报错时使用。
+description: 在 Kimi Code 中通过本机 Codex OAuth 登录使用 GPT 模型，配置、检查、升级和卸载本地代理。
 ---
 
 # using-codex-oauth
 
-本插件通过本地代理(`127.0.0.1:8317`，零依赖 Node 脚本）复用 `~/.codex/auth.json` 中的 ChatGPT OAuth 登录态，把 Kimi Code 的 OpenAI Responses 请求转发到 ChatGPT 后端。代理自动刷新 access token 并注入所需请求头。
+本插件通过本地代理复用文件形式的 Codex OAuth 缓存。上游调用和 token 刷新经 HTTPS 发送到 ChatGPT/OpenAI，作者不提供中转服务。
 
-## 使用
+## 入口
 
-- 首次配置：运行 `/kimi-codex-oauth:setup`。
-- 切换模型:`/model` 选择 `chatgpt/gpt-5.6-luna`（省额度）或 `chatgpt/gpt-5.6-sol`，或启动时 `kimi -m chatgpt/gpt-5.6-luna`。
-- 健康检查:`/kimi-codex-oauth:status`。
-- 代理随会话自动启动（SessionStart hook)；也可手动：`node <插件目录>/bin/ensure-proxy.mjs`。
+- 首次配置或同步：`/kimi-codex-oauth:setup`。
+- 状态与版本：`/kimi-codex-oauth:status`。
+- 切换模型：`/model` 选择配置中实际存在的 `chatgpt/*` 别名。
+- 卸载清理：`/kimi-codex-oauth:uninstall`。
 
-## 排障
+## 行为
 
-- 401 且自动刷新失败 → 登录态失效，重新 `codex login`。
-- 连接被拒 → 代理没起，运行 status 命令或手动 ensure-proxy。
-- 上游报错细节 → `tail -50 ~/.codex/oauth-proxy.log`。
-- 端口冲突 → 设 `CODEX_OAUTH_PORT` 并同步修改 config.toml 里 provider 的 `base_url`。
+SessionStart 拉起代理并同步模型；配置候选未通过校验、没有校验器或上游模型列表不可用时，不写配置，仍结束 Hook。实际写入前保留私有备份。未标记的个人条目和个人 overrides 保留。
 
-## 注意
+代理默认监听 `127.0.0.1:8317`，读取 `~/.codex/auth.json`。支持环境变量 `CODEX_AUTH_PATH`、`CODEX_OAUTH_LOG`、`CODEX_OAUTH_PORT` 和 `KIMI_CODE_HOME`；安装、状态检查和卸载使用一致设置。
 
-复用 ChatGPT 订阅登录态供第三方客户端使用属于 OpenAI 服务条款的灰色地带，账号风险自负。token 只经本机 localhost 转发，不会发送到其他服务器。
+## 排障与升级
+
+401/刷新失败时引导 `codex login`，不要展示或删除登录缓存。健康检查成功不等于模型请求成功。v0.1.0 没有实例状态，升级前需核对旧进程的端口和脚本路径再终止；不要使用批量杀进程命令。新版本通过专用实例控制密钥停止自己的代理。
+
+卸载脚本支持 `--dry-run`，只清理未被引用的受管配置，保留 Codex 登录缓存、日志、备份和个人配置。随后立即移除插件并 reload，避免新会话重新拉起代理。
+
+复用订阅 OAuth 登录态的服务条款适用与账号风险由使用者自行评估，不能承诺官方背书。数据接收方、文件权限和本地接口边界以插件根目录的 `PRIVACY.md` 为准。

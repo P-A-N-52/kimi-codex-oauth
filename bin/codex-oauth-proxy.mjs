@@ -270,7 +270,15 @@ async function handleResponses(req, res) {
       'content-type': upstream.headers.get('content-type') ?? 'text/event-stream',
       'cache-control': 'no-cache',
     });
-    Readable.fromWeb(upstream.body).pipe(res);
+    const upstreamStream = Readable.fromWeb(upstream.body);
+    // Upstream stream resets (HTTP/2 RST, body timeout) surface as an 'error'
+    // event on this stream after forwarding starts; without a listener the
+    // whole proxy process dies.
+    upstreamStream.on('error', (err) => {
+      log(`upstream stream error: ${err.message}`);
+      res.destroy(err);
+    });
+    upstreamStream.pipe(res);
   } catch (e) {
     log(`proxy error: ${e.message}`);
     sendJson(res, 502, { error: { message: `codex-oauth-proxy: ${e.message}` } });

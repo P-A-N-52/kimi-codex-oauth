@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'">
+<title>ChatGPT 额度 · kimi-codex-oauth</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    background: #0d1117; color: #e6edf3; padding: 24px;
+    font-family: -apple-system, "SF Pro", "PingFang SC", "Segoe UI", sans-serif;
+  }
+  .card {
+    width: 100%; max-width: 460px; background: #161b22;
+    border: 1px solid #30363d; border-radius: 16px; padding: 24px;
+  }
+  header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+  h1 { font-size: 17px; font-weight: 600; }
+  .badge {
+    font-size: 12px; padding: 3px 10px; border-radius: 999px;
+    background: #1f6feb33; color: #58a6ff; border: 1px solid #1f6feb66;
+  }
+  .warn {
+    font-size: 13px; color: #f0883e; background: #f0883e1a;
+    border: 1px solid #f0883e55; border-radius: 8px; padding: 8px 12px; margin-bottom: 14px;
+    display: none;
+  }
+  .window { margin-bottom: 18px; }
+  .window .row { display: flex; justify-content: space-between; font-size: 13px; color: #8b949e; margin-bottom: 6px; }
+  .window .row b { color: #e6edf3; font-weight: 600; }
+  .bar { height: 10px; border-radius: 999px; background: #30363d; overflow: hidden; }
+  .bar i { display: block; height: 100%; border-radius: 999px; background: #3fb950; transition: width .4s; }
+  .bar.hot i { background: #f0883e; }
+  .bar.full i { background: #f85149; }
+  .reset-line { font-size: 13px; color: #8b949e; margin-top: 6px; }
+  .reset-line b { color: #e6edf3; font-weight: 600; }
+  .credits {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    border-top: 1px solid #30363d; padding-top: 16px; margin-top: 4px;
+  }
+  .credits .info { font-size: 13px; color: #8b949e; }
+  .credits .info b { color: #e6edf3; font-size: 15px; }
+  button {
+    font: inherit; font-size: 13px; cursor: pointer; border-radius: 8px;
+    padding: 7px 14px; border: 1px solid #3fb95066; background: #3fb9501a; color: #3fb950;
+  }
+  button:disabled { opacity: .4; cursor: default; }
+  button.ghost { border-color: #30363d; background: transparent; color: #8b949e; }
+  footer { display: flex; align-items: center; justify-content: space-between; margin-top: 18px; }
+  footer span { font-size: 12px; color: #6e7681; }
+  .error { color: #f85149; }
+</style>
+</head>
+<body>
+<main class="card">
+  <header>
+    <h1>ChatGPT 订阅额度</h1>
+    <span id="plan" class="badge">…</span>
+  </header>
+  <div id="warn" class="warn"></div>
+  <section id="windows"></section>
+  <section class="credits">
+    <div class="info" id="credits-info">重置卡查询中…</div>
+    <button id="consume" disabled>使用重置卡</button>
+  </section>
+  <footer>
+    <span id="updated"></span>
+    <button id="refresh" class="ghost">刷新</button>
+  </footer>
+</main>
+<script>
+'use strict';
+const $ = (id) => document.getElementById(id);
+let quota = null;
+let ticker = null;
+
+const pad2 = (n) => String(n).padStart(2, '0');
+
+function windowLabel(seconds) {
+  if (typeof seconds !== 'number') return '额度窗口';
+  if (seconds <= 6 * 3600) return '5 小时窗口';
+  if (seconds <= 8 * 86400) return '每周窗口';
+  return '长周期窗口';
+}
+
+function countdown(resetAt) {
+  if (!resetAt) return '重置时间未知';
+  const ms = Date.parse(resetAt) - Date.now();
+  const at = new Date(resetAt);
+  const time = pad2(at.getHours()) + ':' + pad2(at.getMinutes());
+  const sameDay = at.toDateString() === new Date().toDateString();
+  const when = sameDay ? time : (at.getMonth() + 1) + ' 月 ' + at.getDate() + ' 日 ' + time;
+  if (ms <= 0) return '即将重置(' + when + ')';
+  const s = Math.round(ms / 1000);
+  if (s < 3600) return Math.max(1, Math.round(s / 60)) + ' 分钟后重置(' + when + ')';
+  if (s < 86400) {
+    const m = Math.round((s % 3600) / 60);
+    return Math.floor(s / 3600) + ' 小时' + (m ? ' ' + m + ' 分' : '') + '后重置(' + when + ')';
+  }
+  return (Math.round((s / 86400) * 10) / 10) + ' 天后重置(' + when + ')';
+}
+
+function render() {
+  if (!quota) return;
+  $('plan').textContent = quota.plan_type ? '套餐 ' + quota.plan_type : '套餐未知';
+  const warn = $('warn');
+  if (quota.limit_reached === true) {
+    warn.textContent = '限流已触发：请求会被拒绝，可使用重置卡或等待窗口重置。';
+    warn.style.display = 'block';
+  } else {
+    warn.style.display = 'none';
+  }
+  const box = $('windows');
+  box.innerHTML = '';
+  for (const w of [quota.primary_window, quota.secondary_window]) {
+    if (!w) continue;
+    const div = document.createElement('div');
+    div.className = 'window';
+    const cls = w.used_percent >= 100 ? 'full' : (w.used_percent >= 80 ? 'hot' : '');
+    div.innerHTML =
+      '<div class="row"><span>' + windowLabel(w.limit_window_seconds) + '</span>' +
+      '<span>已用 <b>' + w.used_percent + '%</b> · 剩余 <b>' + w.remaining_percent + '%</b></span></div>' +
+      '<div class="bar ' + cls + '"><i style="width:' + w.used_percent + '%"></i></div>' +
+      '<div class="reset-line" data-reset-at="' + (w.reset_at || '') + '">' + countdown(w.reset_at) + '</div>';
+    box.appendChild(div);
+  }
+  const credits = quota.reset_credits || {};
+  const count = typeof credits.available_count === 'number' ? credits.available_count : null;
+  const btn = $('consume');
+  if (count === null) {
+    $('credits-info').textContent = credits.error ? '重置卡查询失败' : '重置卡数量未知';
+    btn.disabled = true;
+  } else {
+    let suffix = '';
+    if (count > 0) {
+      const next = (credits.credits || [])
+        .filter((c) => c.status === 'available' && c.expires_at)
+        .map((c) => Date.parse(c.expires_at)).filter(Number.isFinite).sort((a, b) => a - b)[0];
+      if (next) suffix = '，最近 ' + new Date(next).toLocaleDateString('zh-CN') + ' 过期';
+    }
+    $('credits-info').innerHTML = '重置卡 <b>' + count + '</b> 张可用' + suffix;
+    btn.disabled = count <= 0;
+  }
+  $('updated').textContent = '数据时间 ' + (quota.fetched_at || '');
+}
+
+async function load() {
+  try {
+    const res = await fetch('/quota', { cache: 'no-store' });
+    const data = await res.json();
+    if (!res.ok) throw new Error((data.error && data.error.message) || ('HTTP ' + res.status));
+    quota = data;
+    $('updated').classList.remove('error');
+    render();
+  } catch (e) {
+    $('updated').textContent = '查询失败：' + e.message;
+    $('updated').classList.add('error');
+  }
+}
+
+$('refresh').addEventListener('click', load);
+$('consume').addEventListener('click', async () => {
+  if (!confirm('将消耗 1 张重置卡，立即重置当前限流窗口。\n消耗后不可撤销，确定使用?')) return;
+  const btn = $('consume');
+  btn.disabled = true;
+  try {
+    const res = await fetch('/quota/consume-reset', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error((data.error && data.error.message) || ('HTTP ' + res.status));
+    quota = data.quota;
+    render();
+    alert('已使用 1 张重置卡，重置了 ' + (data.windows_reset ?? '?') + ' 个限流窗口。');
+  } catch (e) {
+    alert('使用失败：' + e.message);
+    load();
+  }
+});
+
+setInterval(() => {
+  document.querySelectorAll('.reset-line').forEach((el) => {
+    el.textContent = countdown(el.getAttribute('data-reset-at'));
+  });
+}, 1000);
+setInterval(load, 60000);
+load();
+</script>
+</body>
+</html>

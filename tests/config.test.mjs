@@ -144,6 +144,10 @@ test('sync CLI adds, preserves user overrides, is idempotent, and refuses missin
   const retired = fs.readFileSync(file, 'utf8');
   assert.ok(retired.includes('[models."chatgpt/fixture-model"]'));
   assert.ok(retired.includes('[models."chatgpt/replacement-model"]'));
+  assert.ok(
+    retired.indexOf('[models."chatgpt/replacement-model"]') < retired.lastIndexOf('[models."chatgpt/fixture-model"]'),
+    'new models are inserted at the top of the chatgpt group',
+  );
   responseData = { live: false, auth_mode: 'apikey', data: [] };
   assert.equal((await runNode(args, env)).code, 0);
   const apiKey = fs.readFileSync(file, 'utf8');
@@ -161,4 +165,34 @@ test('sync CLI adds, preserves user overrides, is idempotent, and refuses missin
   assert.equal(kept.code, 0);
   assert.match(kept.stderr, /kept stale aliases/);
   assert.equal(fs.readFileSync(file, 'utf8'), singleQuoteDefault);
+});
+test('sync CLI retires unmarked plugin aliases that disappeared upstream, keeps custom and referenced ones', async (t) => {
+  const dir = fixture(t);
+  const file = path.join(dir, 'config.toml');
+  const initial = 'default_model = "chatgpt/retired-referenced"\n\n' +
+    '[providers.chatgpt-oauth]\ntype = "openai_responses"\n\n' +
+    '[models."chatgpt/retired"]\nprovider = "chatgpt-oauth"\nmodel = "retired"\n\n' +
+    '[models."chatgpt/retired-referenced"]\nprovider = "chatgpt-oauth"\nmodel = "retired-referenced"\n\n' +
+    '[models."chatgpt/custom"]\nprovider = "other"\nmodel = "custom"\n\n' +
+    '[models."chatgpt/live"]\nprovider = "chatgpt-oauth"\nmodel = "live"\n';
+  fs.writeFileSync(file, initial);
+  const server = http.createServer((_req, res) => {
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ live: true, auth_mode: 'chatgpt', data: [{ slug: 'live', context_window: 1000 }] }));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  const result = await runNode(['--require', './tests/offline-preload.cjs', './bin/sync-models.mjs'], {
+    KIMI_CODE_HOME: dir,
+    CODEX_OAUTH_PORT: String(server.address().port),
+    KIMI_TEST_VALIDATOR: 'accept',
+  });
+  assert.equal(result.code, 0);
+  const out = fs.readFileSync(file, 'utf8');
+  assert.ok(!out.includes('[models."chatgpt/retired"]'), 'retired plugin alias removed');
+  assert.ok(out.includes('[models."chatgpt/retired-referenced"]'), 'referenced alias kept');
+  assert.ok(out.includes('[models."chatgpt/custom"]'), 'custom user alias kept');
+  assert.ok(out.includes('[models."chatgpt/live"]'), 'live alias kept');
+  assert.match(result.stdout, /removed: chatgpt\/retired/);
+  assert.match(result.stderr, /chatgpt\/retired-referenced/);
 });

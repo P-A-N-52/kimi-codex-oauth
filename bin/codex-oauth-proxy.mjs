@@ -7,6 +7,8 @@
 // - Injects the headers the ChatGPT Codex backend requires.
 // - Normalizes request bodies (store=false, stream=true, instructions default,
 //   strips parameters the backend rejects).
+// - Reports subscription quota and banked rate-limit reset credits at /quota,
+//   and redeems one reset credit via POST /quota/consume-reset.
 //
 // Zero dependencies. Requires Node >= 18.
 
@@ -14,6 +16,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { randomUUID } from 'node:crypto';
 import { Readable } from 'node:stream';
 import { pathToFileURL } from 'node:url';
 import { writePrivateAtomic } from './private-file.mjs';
@@ -49,6 +52,132 @@ const FALLBACK_MODELS = [
 const UPSTREAM_MODELS_URL = 'https://chatgpt.com/backend-api/codex/models?client_version=1.0.0';
 const MODELS_CACHE_TTL_MS = 5 * 60 * 1000;
 let modelsCache = { at: 0, models: FALLBACK_MODELS, live: false };
+
+// Subscription quota comes from the same backend the ChatGPT app uses. The
+// banked reset-credit route may be absent for some plans, so it is fetched
+// best-effort and never blocks the quota response.
+const UPSTREAM_USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage';
+const UPSTREAM_RESET_CREDITS_URL = 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits';
+const QUOTA_CACHE_TTL_MS = 60 * 1000;
+let quotaCache = { at: 0, payload: null };
+let quotaRefresh = null;
+
+function normalizeWindow(window) {
+  if (!window || typeof window.used_percent !== 'number') return null;
+  const used = Math.min(100, Math.max(0, Math.round(window.used_percent)));
+  const out = {
+    used_percent: used,
+    remaining_percent: 100 - used,
+    limit_window_seconds: typeof window.limit_window_seconds === 'number' ? window.limit_window_seconds : null,
+    reset_at: typeof window.reset_at === 'number' ? new Date(window.reset_at * 1000).toISOString() : null,
+  };
+  out.resets_in_s = typeof window.reset_after_seconds === 'number'
+    ? Math.max(0, Math.round(window.reset_after_seconds))
+    : (out.reset_at ? Math.max(0, Math.round((Date.parse(out.reset_at) - Date.now()) / 1000)) : null);
+  return out;
+}
+
+async function fetchUpstreamJson(url, auth, options = {}) {
+  const res = await fetch(url, {
+    ...options,
+    headers: { ...upstreamHeaders(auth), accept: 'application/json' },
+    signal: AbortSignal.timeout(10000),
+  });
+  // Upstream error bodies can contain account details; report status only.
+  if (!res.ok) throw new Error('upstream quota endpoint: HTTP ' + res.status);
+  try { return await res.json(); }
+  catch { throw new Error('upstream quota endpoint returned invalid JSON'); }
+}
+
+async function refreshQuota() {
+  const auth = await getAuth(false);
+  const usage = await fetchUpstreamJson(UPSTREAM_USAGE_URL, auth);
+  const rateLimit = usage.rate_limit ?? {};
+  const payload = {
+    ok: true,
+    fetched_at: new Date().toISOString(),
+    plan_type: typeof usage.plan_type === 'string' ? usage.plan_type : null,
+    allowed: typeof rateLimit.allowed === 'boolean' ? rateLimit.allowed : null,
+    limit_reached: typeof rateLimit.limit_reached === 'boolean' ? rateLimit.limit_reached : null,
+    primary_window: normalizeWindow(rateLimit.primary_window),
+    secondary_window: normalizeWindow(rateLimit.secondary_window),
+    reset_credits: {
+      available_count: typeof usage.rate_limit_reset_credits?.available_count === 'number'
+        ? usage.rate_limit_reset_credits.available_count : null,
+      credits: [],
+    },
+  };
+  try {
+    const data = await fetchUpstreamJson(UPSTREAM_RESET_CREDITS_URL, auth);
+    const list = Array.isArray(data) ? data : (Array.isArray(data.credits) ? data.credits : []);
+    payload.reset_credits.credits = list
+      .filter((c) => c && typeof c.id === 'string')
+      .map((c) => ({
+        id: c.id,
+        status: typeof c.status === 'string' ? c.status : null,
+        granted_at: typeof c.granted_at === 'string' ? c.granted_at : null,
+        expires_at: typeof c.expires_at === 'string' ? c.expires_at : null,
+      }));
+    if (payload.reset_credits.available_count === null) {
+      payload.reset_credits.available_count =
+        payload.reset_credits.credits.filter((c) => c.status === 'available').length;
+    }
+  } catch (e) {
+    log('reset credits fetch failed: ' + e.message);
+    payload.reset_credits.error = e.message;
+  }
+  quotaCache = { at: Date.now(), payload };
+  return payload;
+}
+
+async function getQuota(force = false) {
+  if (!force && quotaCache.payload) {
+    if (Date.now() - quotaCache.at < QUOTA_CACHE_TTL_MS) return quotaCache.payload;
+    // Stale cache: answer instantly and refresh in the background, so fast
+    // consumers (status line, 300ms budget) never wait on the upstream.
+    if (!quotaRefresh) {
+      quotaRefresh = refreshQuota()
+        .catch((e) => log('quota refresh failed: ' + e.message))
+        .finally(() => { quotaRefresh = null; });
+    }
+    return { ...quotaCache.payload, stale: true };
+  }
+  if (!quotaRefresh) {
+    quotaRefresh = refreshQuota().finally(() => { quotaRefresh = null; });
+  }
+  return quotaRefresh;
+}
+
+async function consumeResetCredit(creditId) {
+  let target = typeof creditId === 'string' && creditId ? creditId : null;
+  if (!target) {
+    // Default to the available credit that expires soonest.
+    const quota = await getQuota(true);
+    const available = quota.reset_credits.credits
+      .filter((c) => c.status === 'available')
+      .sort((a, b) => (Date.parse(a.expires_at) || Infinity) - (Date.parse(b.expires_at) || Infinity));
+    if (available.length === 0) throw new Error('no available reset credits');
+    target = available[0].id;
+  }
+  const auth = await getAuth(false);
+  const data = await fetchUpstreamJson(UPSTREAM_RESET_CREDITS_URL + '/consume', auth, {
+    method: 'POST',
+    body: JSON.stringify({ credit_id: target, redeem_request_id: randomUUID() }),
+  });
+  quotaCache = { at: 0, payload: null };
+  // A background refresh triggered before the consume would finish with
+  // pre-consume numbers; let it settle, then fetch fresh quota.
+  if (quotaRefresh) await quotaRefresh.catch(() => {});
+  const quota = await getQuota(true);
+  return {
+    ok: true,
+    code: typeof data.code === 'string' ? data.code : null,
+    windows_reset: typeof data.windows_reset === 'number' ? data.windows_reset : null,
+    redeemed_at: typeof data.credit?.redeemed_at === 'string' ? data.credit.redeemed_at : null,
+    credit_id: target,
+    quota,
+  };
+}
 
 async function getModels() {
   if (Date.now() - modelsCache.at < MODELS_CACHE_TTL_MS) return modelsCache;
@@ -250,6 +379,21 @@ function sendJson(res, status, obj) {
   res.end(text);
 }
 
+// The quota dashboard is a static, self-contained page; it only ever calls
+// the same origin's /quota endpoints (enforced by its CSP meta tag).
+let dashboardHtml = null;
+function handleDashboard(_req, res) {
+  try {
+    if (dashboardHtml === null) {
+      dashboardHtml = fs.readFileSync(new URL('./quota-page.html', import.meta.url), 'utf8');
+    }
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-cache' });
+    res.end(dashboardHtml);
+  } catch {
+    sendJson(res, 500, { error: { message: 'quota dashboard page is missing from the installation' } });
+  }
+}
+
 async function handleResponses(req, res) {
   let body;
   try {
@@ -309,6 +453,30 @@ function handleHealthz(_req, res, state) {
   sendJson(res, info.ok ? 200 : 500, info);
 }
 
+async function handleQuota(_req, res) {
+  try {
+    sendJson(res, 200, await getQuota(false));
+  } catch (e) {
+    log('quota error: ' + e.message);
+    sendJson(res, 502, { ok: false, error: { message: 'codex-oauth-proxy: ' + e.message } });
+  }
+}
+
+async function handleConsumeReset(req, res) {
+  let body;
+  try {
+    body = await readRequestJson(req);
+  } catch {
+    return sendJson(res, 400, { error: { message: 'invalid JSON request body' } });
+  }
+  try {
+    sendJson(res, 200, await consumeResetCredit(body?.credit_id));
+  } catch (e) {
+    log('consume reset credit error: ' + e.message);
+    sendJson(res, 502, { ok: false, error: { message: 'codex-oauth-proxy: ' + e.message } });
+  }
+}
+
 export function createProxyServer() {
   let state;
   let instanceFile;
@@ -341,6 +509,15 @@ export function createProxyServer() {
         data: models.map((m) => ({ ...m, id: m.slug, object: 'model', created: 0, owned_by: 'chatgpt-oauth' })),
       });
     }
+    if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/quota/view')) {
+      return void handleDashboard(req, res);
+    }
+    if (req.method === 'GET' && url.pathname === '/quota') {
+      return void handleQuota(req, res);
+    }
+    if (req.method === 'POST' && url.pathname === '/quota/consume-reset') {
+      return void handleConsumeReset(req, res);
+    }
     if (req.method === 'GET' && url.pathname === '/healthz') {
       return void handleHealthz(req, res, state);
     }
@@ -366,6 +543,9 @@ export function createProxyServer() {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
   const server = createProxyServer();
+  // Warm the quota cache so the status line and dashboard stay fast. Done only
+  // here, not in createProxyServer: tests must never trigger a real fetch.
+  server.on('listening', () => { getQuota().catch(() => {}); });
   server.on('error', (e) => { console.error('codex-oauth-proxy: ' + e.message); process.exitCode = 1; });
   for (const signal of ['SIGINT', 'SIGTERM']) {
     process.on(signal, () => { server.close(); server.closeAllConnections(); });

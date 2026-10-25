@@ -18,13 +18,14 @@
 
 - `chatgpt.com/backend-api/codex/responses`：发送 Kimi Code 交给当前 provider 的输入、上下文、工具定义或结果，以及 access token 和账号标识；接收模型回复。
 - `chatgpt.com/backend-api/codex/models`：发送 access token 和账号标识，获取账号可用模型及元数据。
+- `chatgpt.com/backend-api/wham/usage` 与 `chatgpt.com/backend-api/wham/rate-limit-reset-credits`：发送 access token 和账号标识，读取订阅额度窗口与可用重置卡；仅在用户确认后调用其 `consume` 子路径消耗一张重置卡。
 - `auth.openai.com/oauth/token`：发送 refresh token 和 Codex 的公开客户端 ID，刷新登录凭据。
 
 因此，准确的描述是“没有插件作者运营的中转服务”，而不是“token 和内容永不离开本机”。上游数据处理受相应服务条款和账号设置约束；本地代理设置 `store=false` 不代表对上游保留策略作额外保证。
 
 ## 本地接口边界
 
-`/v1/responses` 和 `/v1/models` 沿用本地访问方式，配置中的 `local-proxy` 是占位值，不提供调用鉴权。能连接本机端口的其他程序也可能调用这些接口。请在自己的可信设备上使用，不要把端口暴露到局域网或公网。
+`/v1/responses`、`/v1/models` 和 `/quota` 沿用本地访问方式，配置中的 `local-proxy` 是占位值，不提供调用鉴权。能连接本机端口的其他程序也可能调用这些接口（包括消耗重置卡的 `/quota/consume-reset`）。请在自己的可信设备上使用，不要把端口暴露到局域网或公网。
 
 停止接口单独使用每个实例的随机控制密钥。停止脚本先核对健康响应中的服务名、实例标识和进程 ID，再发送停止请求；不会按照进程名批量杀死 Node.js。
 

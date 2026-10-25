@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import { once } from 'node:events';
 import { fixture, fakeAuth, httpJson, runNode } from './helpers.mjs';
@@ -198,4 +199,166 @@ test('uninstall preview is read-only; cleanup stops the instance, backs up confi
   assert.equal(fs.readFileSync(path.join(instance.dir, backups[0]), 'utf8'), config);
   const repeated = await runNode(args, instance.env);
   assert.equal(repeated.code, 0, repeated.stderr);
+});
+
+const usageFixture = (used) => ({
+  plan_type: 'plus',
+  rate_limit: {
+    allowed: used < 100,
+    limit_reached: used >= 100,
+    primary_window: {
+      used_percent: used, limit_window_seconds: 18000,
+      reset_after_seconds: 3600, reset_at: Math.floor(Date.now() / 1000) + 3600,
+    },
+    secondary_window: {
+      used_percent: 12.4, limit_window_seconds: 604800,
+      reset_after_seconds: 86400, reset_at: Math.floor(Date.now() / 1000) + 86400,
+    },
+  },
+  rate_limit_reset_credits: { available_count: 2 },
+});
+const creditsFixture = () => ({
+  credits: [
+    {
+      id: 'RateLimitResetCredit_synthetic1', status: 'available',
+      granted_at: '2026-06-12T01:33:14Z', expires_at: '2026-07-12T01:33:14Z',
+    },
+    { id: 'RateLimitResetCredit_synthetic2', status: 'redeemed' },
+  ],
+});
+const USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage';
+const CREDITS_URL = 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits';
+
+test('quota reports remaining percent and reset credits, and caches upstream calls', async (t) => {
+  const instance = await start(t);
+  let usageCalls = 0;
+  globalThis.fetch = async (url) => {
+    if (url === USAGE_URL) { usageCalls++; return Response.json(usageFixture(40)); }
+    if (url === CREDITS_URL) return Response.json(creditsFixture());
+    throw new Error('unexpected upstream request: ' + url);
+  };
+  const first = await httpJson(instance.port, '/quota');
+  assert.equal(first.status, 200);
+  const quota = JSON.parse(first.text);
+  assert.equal(quota.ok, true);
+  assert.equal(quota.plan_type, 'plus');
+  assert.equal(quota.primary_window.remaining_percent, 60);
+  assert.ok(quota.primary_window.resets_in_s > 3500 && quota.primary_window.resets_in_s <= 3600);
+  assert.equal(quota.secondary_window.used_percent, 12);
+  assert.equal(quota.reset_credits.available_count, 2);
+  assert.equal(quota.reset_credits.credits.length, 2);
+  assert.equal(quota.reset_credits.credits[0].expires_at, '2026-07-12T01:33:14Z');
+  const second = await httpJson(instance.port, '/quota');
+  assert.equal(second.status, 200);
+  assert.equal(usageCalls, 1);
+  assert.ok(!first.text.includes('synthetic-refresh-never-send'));
+});
+
+test('consume reset credit picks the soonest-expiring credit, sends idempotency key and refreshes quota', async (t) => {
+  const instance = await start(t);
+  let used = 100;
+  let consumedBody = null;
+  globalThis.fetch = async (url, options = {}) => {
+    if (url === USAGE_URL) return Response.json(usageFixture(used));
+    if (url === CREDITS_URL) return Response.json(creditsFixture());
+    if (url === CREDITS_URL + '/consume') {
+      assert.equal(options.method, 'POST');
+      consumedBody = JSON.parse(options.body);
+      used = 0;
+      return Response.json({
+        code: 'reset', windows_reset: 1,
+        credit: { id: consumedBody.credit_id, status: 'redeemed', redeemed_at: '2026-06-13T13:12:31Z' },
+      });
+    }
+    throw new Error('unexpected upstream request: ' + url);
+  };
+  const res = await httpJson(instance.port, '/quota/consume-reset', {
+    method: 'POST', body: '{}', headers: { 'content-type': 'application/json' },
+  });
+  assert.equal(res.status, 200);
+  const result = JSON.parse(res.text);
+  assert.equal(result.ok, true);
+  assert.equal(result.credit_id, 'RateLimitResetCredit_synthetic1');
+  assert.equal(result.windows_reset, 1);
+  assert.equal(result.redeemed_at, '2026-06-13T13:12:31Z');
+  assert.match(consumedBody.redeem_request_id, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+  assert.equal(result.quota.primary_window.used_percent, 0);
+  assert.equal(result.quota.limit_reached, false);
+  assert.ok(!res.text.includes('synthetic-refresh-never-send'));
+});
+
+test('quota failures never include upstream response bodies in output or logs', async (t) => {
+  const instance = await start(t);
+  const secret = 'synthetic-quota-secret-never-log';
+  globalThis.fetch = async () => new Response(secret, { status: 403 });
+  const res = await httpJson(instance.port, '/quota');
+  assert.equal(res.status, 502);
+  assert.match(res.text, /HTTP 403/);
+  assert.ok(!res.text.includes(secret));
+  assert.ok(!fs.readFileSync(instance.log, 'utf8').includes(secret));
+});
+
+test('quota CLI renders the card and hints at ensure-proxy when the proxy is down', async (t) => {
+  const instance = await start(t);
+  globalThis.fetch = async (url) => {
+    if (url === USAGE_URL) return Response.json(usageFixture(40));
+    if (url === CREDITS_URL) return Response.json(creditsFixture());
+    throw new Error('unexpected upstream request: ' + url);
+  };
+  const args = ['--require', './tests/offline-preload.cjs', './bin/quota.mjs'];
+  const ok = await runNode(args, instance.env);
+  assert.equal(ok.code, 0, ok.stderr);
+  assert.match(ok.stdout, /套餐 plus/);
+  assert.match(ok.stdout, /剩余 60%/);
+  assert.match(ok.stdout, /5小时窗口/);
+  assert.match(ok.stdout, /每周窗口/);
+  assert.match(ok.stdout, /重置卡\s+2 张可用/);
+  assert.ok(!ok.stdout.includes('synthetic'));
+  const probe = http.createServer();
+  probe.listen(0, '127.0.0.1');
+  await once(probe, 'listening');
+  const freePort = probe.address().port;
+  probe.close();
+  await once(probe, 'close');
+  const down = await runNode(args, { ...instance.env, CODEX_OAUTH_PORT: String(freePort) });
+  assert.equal(down.code, 1);
+  assert.match(down.stderr, /ensure-proxy/);
+});
+
+test('dashboard serves a self-contained page with a locked-down CSP', async (t) => {
+  const instance = await start(t);
+  globalThis.fetch = async () => { throw new Error('unexpected upstream request'); };
+  for (const route of ['/', '/quota/view']) {
+    const res = await httpJson(instance.port, route);
+    assert.equal(res.status, 200);
+    assert.match(res.text, /ChatGPT 订阅额度/);
+    assert.match(res.text, /Content-Security-Policy/);
+    assert.ok(!res.text.includes('https://'), 'dashboard must not reference external resources');
+  }
+});
+
+test('quota CLI --statusline prints one compact line and stays silent when down', async (t) => {
+  const instance = await start(t);
+  globalThis.fetch = async (url) => {
+    if (url === USAGE_URL) return Response.json(usageFixture(40));
+    if (url === CREDITS_URL) return Response.json(creditsFixture());
+    throw new Error('unexpected upstream request: ' + url);
+  };
+  const args = ['--require', './tests/offline-preload.cjs', './bin/quota.mjs', '--statusline'];
+  const ok = await runNode(args, instance.env);
+  assert.equal(ok.code, 0, ok.stderr);
+  const lines = ok.stdout.trim().split('\n');
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /5h余60%/);
+  assert.match(lines[0], /周余88%/);
+  assert.match(lines[0], /重置卡×2/);
+  const probe = http.createServer();
+  probe.listen(0, '127.0.0.1');
+  await once(probe, 'listening');
+  const freePort = probe.address().port;
+  probe.close();
+  await once(probe, 'close');
+  const down = await runNode(args, { ...instance.env, CODEX_OAUTH_PORT: String(freePort) });
+  assert.equal(down.code, 1);
+  assert.equal(down.stdout.trim(), '');
 });

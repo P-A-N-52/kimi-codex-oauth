@@ -10,8 +10,11 @@
 //             or that became unusable (login switched to API key) are deleted —
 //             unless still referenced by default_model / secondary_model, in
 //             which case they are kept and a warning is printed.
-//   - Hands off: entries without the marker are user-owned and never touched;
-//             [models."chatgpt/x".overrides] tables are never touched either.
+//   - Retire: unmarked `chatgpt/*` aliases that still point at the plugin
+//             provider are removed too when their slug is gone upstream. This
+//             only happens with a live upstream list; other unmarked entries
+//             remain user-owned.
+//   - Hands off: [models."chatgpt/x".overrides] tables are never touched.
 //
 // Writes only when something actually changed, and only after the candidate
 // config passes `kimi doctor` in a sandbox. Fail-open (always exits 0) so it
@@ -87,6 +90,44 @@ function blockFromFields(header, fields) {
   const lines = ['', header, MARKER];
   for (const [k, v] of Object.entries(fields)) lines.push(`${k} = ${v}`);
   return lines.join('\n') + '\n';
+}
+
+// New models go before the first `chatgpt/*` block. Kimi Code's model picker
+// groups providers by their first appearance in config order, so appending at
+// EOF would put every new model at the bottom of the ChatGPT OAuth group.
+function insertModelBlocks(config, addition) {
+  if (!addition) return config;
+  const blocks = sections(config);
+  const anchor = blocks.find((block) => /^\[models\."chatgpt\//.test(block.header))
+    ?? blocks.find((block) => /^\[models\./.test(block.header));
+  if (!anchor) return config.trimEnd() + '\n' + addition;
+  const before = config.slice(0, anchor.start);
+  const separator = before.length === 0 ? '' : before.endsWith('\n\n') ? '' : before.endsWith('\n') ? '\n' : '\n\n';
+  const body = addition.replace(/^\n/, '');
+  return before + separator + body + '\n' + config.slice(anchor.start);
+}
+
+// Read a top-level string field from a block body, ignoring values inside
+// multiline strings.
+function topLevelString(body, key) {
+  const lines = body.split('\n');
+  const topLevel = tomlLines(body).map((line) => line.topLevel);
+  for (let i = 0; i < lines.length; i++) {
+    if (!topLevel[i]) continue;
+    const m = lines[i].match(/^([a-z_]+)\s*=\s*(.*)$/);
+    if (!m || m[1] !== key) continue;
+    const value = m[2].trim();
+    if (value.startsWith('"') && value.endsWith('"')) {
+      try { return JSON.parse(value); } catch { return null; }
+    }
+    if (value.startsWith("'") && value.endsWith("'")) return value.slice(1, -1);
+    return null;
+  }
+  return null;
+}
+
+function isPluginAlias(body, slug) {
+  return topLevelString(body, 'provider') === 'chatgpt-oauth' && topLevelString(body, 'model') === slug;
 }
 
 // Reconcile managed field lines inside a block body (lines after the header).
@@ -170,7 +211,22 @@ try {
     const { start, end, header, managed, text } = headers[i];
     const bodyStart = start + text.match(/^[^\n]*(?:\n|$)/)[0].length;
     const body = out.slice(bodyStart, end);
-    if (!managed) continue; // user-owned — hands off
+    const isModel = header !== PROVIDER_HEADER;
+    const slug = isModel ? header.match(/chatgpt\/([^"]+)/)[1] : null;
+    if (!managed) {
+      // Unmarked aliases are user-owned, except plugin-shaped entries whose
+      // model disappeared upstream. Only retire them when the upstream list is
+      // trustworthy; a referenced alias is preserved and reported.
+      if (isModel && authMode === 'chatgpt' && !bySlug.has(slug) && isPluginAlias(body, slug)) {
+        if (referenced.has(slug)) {
+          keptReferenced.push(slug);
+        } else {
+          out = out.slice(0, start) + out.slice(end);
+          removed.push(slug);
+        }
+      }
+      continue;
+    }
     if (header === PROVIDER_HEADER) {
       if (authMode === 'chatgpt') {
         const { body: fixed, changed } = reconcileBody(body, PROVIDER_FIELDS);
@@ -181,7 +237,6 @@ try {
       }
       continue; // provider deletion handled after the model pass
     }
-    const slug = header.match(/chatgpt\/([^"]+)/)[1];
     const stale = authMode === 'apikey' || !bySlug.has(slug);
     if (stale) {
       if (referenced.has(slug)) {
@@ -209,20 +264,23 @@ try {
     removed.push('(provider)');
   }
 
-  // 3) Add missing entries (chatgpt auth only; provider first, then models).
+  // 3) Add missing entries (chatgpt auth only). New model blocks go to the
+  //    top of the chatgpt group; the provider block stays at the end.
   if (authMode === 'chatgpt') {
-    let addition = '';
+    let providerAddition = '';
+    let modelAddition = '';
     if (!remaining.some((block) => /^\[providers\.(?:chatgpt-oauth|"chatgpt-oauth"|'chatgpt-oauth')\]$/.test(block.header))) {
-      addition += blockFromFields(PROVIDER_HEADER, PROVIDER_FIELDS);
+      providerAddition = blockFromFields(PROVIDER_HEADER, PROVIDER_FIELDS);
     }
     for (const m of models) {
       const slug = m.slug ?? m.id;
       if (!existing.has(slug)) {
-        addition += blockFromFields(`[models."chatgpt/${slug}"]`, modelCreateFields(m));
+        modelAddition += blockFromFields(`[models."chatgpt/${slug}"]`, modelCreateFields(m));
         added.push(slug);
       }
     }
-    if (addition) out = out.trimEnd() + '\n' + addition;
+    if (modelAddition) out = insertModelBlocks(out, modelAddition);
+    if (providerAddition) out = out.trimEnd() + '\n' + providerAddition;
   }
 
   if (keptReferenced.length) {

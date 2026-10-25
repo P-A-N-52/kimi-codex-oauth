@@ -11,12 +11,13 @@ description: 在 Kimi Code 中通过本机 Codex OAuth 登录使用 GPT 模型�
 
 - 首次配置或同步：`/kimi-codex-oauth:setup`。
 - 状态与版本：`/kimi-codex-oauth:status`。
+- 剩余额度、重置时间与重置卡：`/kimi-codex-oauth:quota`（消耗重置卡需用户确认，不可撤销）；代理运行时浏览器打开 `http://127.0.0.1:8317/` 可看自动刷新的仪表盘，`bin/quota.mjs --statusline` 可接入底栏状态行（见 README「桌面展示」)。
 - 切换模型：`/model` 选择配置中实际存在的 `chatgpt/*` 别名。
 - 卸载清理：`/kimi-codex-oauth:uninstall`。
 
 ## 行为
 
-SessionStart 拉起代理并同步模型；配置候选未通过校验、没有校验器或上游模型列表不可用时，不写配置，仍结束 Hook。实际写入前保留私有备份。未标记的个人条目和个人 overrides 保留。
+SessionStart 拉起代理并同步模型；配置候选未通过校验、没有校验器或上游模型列表不可用时，不写配置，仍结束 Hook。实际写入前保留私有备份。未标记的个人条目和个人 overrides 保留；指向插件 provider 且上游已消失的 `chatgpt/*` 别名会自动清理。
 
 代理默认监听 `127.0.0.1:8317`，读取 `~/.codex/auth.json`。支持环境变量 `CODEX_AUTH_PATH`、`CODEX_OAUTH_LOG`、`CODEX_OAUTH_PORT` 和 `KIMI_CODE_HOME`；安装、状态检查和卸载使用一致设置。
 

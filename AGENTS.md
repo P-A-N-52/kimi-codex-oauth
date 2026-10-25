@@ -8,14 +8,16 @@
 - 任何测试、命令、日志不得展示真实 access/refresh token、实例停止密钥或完整私有配置。
 - ensure-proxy 与 sync-models 的失败必须 exit 0，不能阻塞 SessionStart；但 exit 0 不代表操作成功。无法验证候选配置时绝不写入。
 - auth.json 和 config.toml 的写入使用私有临时文件和原子 rename。保留 Windows DACL，收紧 POSIX 权限；配置写入前保留私有备份并检查并发改动。
-- 带完整行 `# managed-by: kimi-codex-oauth` 的段落由插件管理；未标记条目归用户。个人 overrides、默认/次级模型引用必须保留。上游失败时不清理模型。
+- 带完整行 `# managed-by: kimi-codex-oauth` 的段落由插件管理；未标记条目通常归用户，但指向插件 provider 且上游列表可信时已消失的 `chatgpt/*` 别名会自动清理。个人 overrides、默认/次级模型引用必须保留。上游失败时不清理模型。
 - API key 登录不适用于此代理。原项目提示的订阅 OAuth 账号/服务条款风险不得被改写为获官方授权或无风险。
 - 停止代理需核对实例身份和控制密钥；不能按照 Node.js 进程名批量终止，也不能因为残留 PID 文件就发送信号。
 
 ## 文件
 
-- bin/codex-oauth-proxy.mjs：Responses/Models/health 代理，OAuth 刷新和受控停止。
+- bin/codex-oauth-proxy.mjs：Responses/Models/health 代理，OAuth 刷新和受控停止；`/quota` 读取订阅额度与重置卡，`/quota/consume-reset` 在用户确认后消耗一张重置卡（不可撤销）。
 - bin/ensure-proxy.mjs：幂等启动和识别旧版本。
+- bin/quota.mjs：额度卡片 CLI，渲染窗口用量、重置倒计时与可用重置卡；`--statusline` 输出单行底栏摘要（静默失败，供 tui.toml `[status_line].command` 使用）。
+- bin/quota-page.html：自包含仪表盘页面（CSP 锁定、仅调用同源 /quota)，代理由 `/` 与 `/quota/view` 提供。
 - bin/sync-models.mjs：根据上游真实元数据同步受管配置。
 - bin/private-file.mjs：私有文件权限与原子替换。
 - bin/config-file.mjs：配置校验、备份和保守清理。

@@ -1,6 +1,6 @@
 # kimi-codex-oauth
 
-让 Kimi Code 使用本机 Codex CLI 的 ChatGPT OAuth 登录态，通过本地代理调用账号可用的 GPT 模型。当前版本 **0.1.1**，零 npm 依赖。
+让 Kimi Code 使用本机 Codex CLI 的 ChatGPT OAuth 登录态，通过本地代理调用账号可用的 GPT 模型。当前版本 **0.2.0**，零 npm 依赖。
 
 [更新记录](CHANGELOG.md) · [数据与权限](PRIVACY.md) · [测试说明](TESTING.md) · [问题反馈](https://github.com/P-A-N-52/kimi-codex-oauth/issues)
 
@@ -29,7 +29,7 @@ Kimi Code 通过普通的 `openai_responses` provider 接入，无需给 Kimi Co
 在 Kimi Code 中：
 
 ```text
-/plugins install https://github.com/P-A-N-52/kimi-codex-oauth/releases/tag/v0.1.1
+/plugins install https://github.com/P-A-N-52/kimi-codex-oauth/releases/tag/v0.2.0
 /reload
 /kimi-codex-oauth:setup
 ```
@@ -40,13 +40,28 @@ Kimi Code 通过普通的 `openai_responses` provider 接入，无需给 Kimi Co
 
 - `/kimi-codex-oauth:setup`：配置或重新同步；没有变化时不改写文件。
 - `/kimi-codex-oauth:status`：检查代理、登录模式和 token 有效期。
+- `/kimi-codex-oauth:quota`：查看订阅剩余额度、各限流窗口的重置时间和可用重置卡；确认后也可消耗一张重置卡立即重置限流窗口。
 - `/kimi-codex-oauth:uninstall`：预览并清理受管配置、停止代理，然后移除插件。
+
+额度数据来自 ChatGPT 后端的 `wham/usage`，代理缓存 60 秒。重置卡消耗成功后不可撤销，命令会在消耗前要求确认。也可以在终端直接运行 `node "<插件目录>/bin/quota.mjs"`(`--json` 输出原始数据，`--consume-reset` 消耗重置卡）。
+
+### 桌面展示
+
+- **仪表盘页面**：代理运行时在浏览器打开 `http://127.0.0.1:8317/`（路径 `/quota/view` 亦可），展示套餐、各窗口用量与倒计时、可用重置卡，每分钟自动刷新、倒计时每秒跳动，可在页面确认后直接消耗重置卡。页面自包含（CSP 锁定、无外部资源），只与本机代理通信。
+- **底栏状态行**：在 `~/.kimi-code/tui.toml` 中加入（`<插件目录>` 替换为实际目录）:
+
+  ```toml
+  [status_line]
+  command = "node \"<插件目录>/bin/quota.mjs\" --statusline"
+  ```
+
+  `/reload-tui` 后底栏常驻显示，形如 `k3 ⎇ main | ⚡ 5h余62% 周余92% · 重置卡×1`。注意状态行命令会替换整个内置底栏，脚本会尽量带回模型与分支信息；代理未运行或超时(300ms）时静默失败，自动回退内置底栏。已有自定义 `[status_line].command` 时不要直接覆盖，可把本脚本串接进现有命令。
 
 SessionStart Hook 自动启动代理并同步模型。上游模型元数据决定上下文长度、输入能力和推理档位；新别名初始使用所支持的最高推理档，之后保留用户对 `default_effort` 的选择。
 
 配置管理规则：
 
-- 带 `# managed-by: kimi-codex-oauth` 的段落属于插件管理范围；移除标记后视为个人条目。
+- 带 `# managed-by: kimi-codex-oauth` 的段落属于插件管理范围；移除标记后通常视为个人条目。例外：仍指向 `chatgpt-oauth` provider 且 slug 已不在上游列表的 `chatgpt/*` 别名会自动删除；被默认/次级模型或 overrides 引用的除外。上游列表不可用时不做删除。
 - 保留个人 overrides。模型退役或切到 API key 登录时，清理条件满足的受管模型；仍被默认/次级模型引用的别名保留。
 - 获取模型失败时跳过同步，不据此删除模型。
 - 写入前使用独立临时目录做配置校验；校验失败、超时或校验器缺失时保留原配置，Hook 仍正常结束。Python fallback 只检查 TOML 语法，不等同于 Kimi 完整配置校验。
@@ -54,15 +69,15 @@ SessionStart Hook 自动启动代理并同步模型。上游模型元数据决�
 
 如需回退配置，先停止相关同步/编辑，确认当前配置与备份的差异，再用选定备份恢复；不要覆盖备份生成后新增的个人配置。
 
-## 从 0.1.0 升级
+## 从旧版本升级
 
-旧代理会继续运行到进程退出，即使插件文件已经更新。v0.1.0 没有实例状态，v0.1.1 不会根据进程名猜测并终止它。
+v0.1.0 的旧代理会继续运行到进程退出，即使插件文件已经更新。v0.1.0 没有实例状态，新版本不会根据进程名猜测并终止它。
 
 1. 在升级前确认默认 `8317` 端口上的旧进程。macOS/Linux 可用 `lsof -nP -iTCP:8317 -sTCP:LISTEN` 查 PID，再用 `ps -p <PID> -o pid=,command=` 核对它确实运行本插件的 `bin/codex-oauth-proxy.mjs`。
 2. 只终止已确认的那个 PID，例如 macOS/Linux 的 `kill -TERM <PID>`。Windows 可先使用 `Get-NetTCPConnection` 查看监听者，再通过 `Get-CimInstance Win32_Process` 核对路径，最后 `Stop-Process -Id <PID>`。不要使用按名称批量杀进程的命令。
-3. 按安装步骤安装新 Release 并运行 setup；status 的健康响应应显示 `version: "0.1.1"`。
+3. 按安装步骤安装新 Release 并运行 setup；status 的健康响应应显示当前版本号。
 
-从带实例状态的版本升级时，启动脚本可以核对并停止旧实例再启动新版本。旧 setup 生成的未标记条目仍按个人配置保留，不自动接管或删除。
+从带实例状态的版本升级时，启动脚本可以核对并停止旧实例再启动新版本。旧 setup 生成的未标记条目不会被自动接管；其中指向插件 provider 且上游已消失的别名按上面的退役规则清理，其余保留。
 
 ## 停止代理与卸载
 
@@ -80,7 +95,7 @@ node "<插件目录>/bin/uninstall.mjs" --dry-run
 node "<插件目录>/bin/uninstall.mjs"
 ```
 
-清理脚本只停止能核对身份的实例，并备份、校验和清理未被引用的受管配置。默认模型、次级模型池、个人 overrides 仍引用的别名会保留并列出；先把默认模型切换到可用的其他 provider，才能清理这些引用。个人条目始终保留。v0.1.0 的旧代理按上一节处理。
+清理脚本只停止能核对身份的实例，并备份、校验和清理未被引用的受管配置。默认模型、次级模型池、个人 overrides 仍引用的别名会保留并列出；先把默认模型切换到可用的其他 provider，才能清理这些引用。个人条目保留；仅上游已消失的插件形态别名会自动清理。v0.1.0 的旧代理按上一节处理。
 
 清理后，在开启新会话之前立即运行：
 

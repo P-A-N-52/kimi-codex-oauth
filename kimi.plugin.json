@@ -1,6 +1,6 @@
 {
   "name": "kimi-codex-oauth",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Reuse the local ChatGPT OAuth login (from Codex CLI, ~/.codex/auth.json) to call GPT models from Kimi Code via a local proxy.",
   "keywords": ["openai", "chatgpt", "codex", "oauth", "gpt-5"],
   "license": "MIT",

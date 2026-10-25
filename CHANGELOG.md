@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.0 — 2026-09-23
+
+- 新增额度查询：代理提供 `GET /quota`(经 `wham/usage` 读取套餐、限流窗口用量与重置时间，并尽力读取 `wham/rate-limit-reset-credits` 的可用重置卡）,`bin/quota.mjs` 渲染中文额度卡片，新增 `/kimi-codex-oauth:quota` 命令。
+- 新增重置卡消耗：用户确认后 `POST /quota/consume-reset`（或 `node bin/quota.mjs --consume-reset`）按官方客户端契约消耗一张重置卡并返回刷新后的额度；消耗不可撤销，命令提示词要求先确认。
+- 新增桌面展示：代理在 `GET /`（同 `/quota/view`）提供自包含的中文仪表盘页面（每分钟自动刷新、倒计时每秒跳动、确认后消耗重置卡；CSP 锁定、无外部资源）;`bin/quota.mjs --statusline` 输出单行额度摘要，可接入 `tui.toml` 的 `[status_line].command`，失败时静默回退内置底栏。
+- 额度接口带 60 秒缓存；上游错误只记录状态码，不返回、不记录响应正文。
+- 未标记的旧 `chatgpt/*` 别名若仍指向插件 provider 且模型已从上游列表消失，会在上游列表可信时自动清理；被默认/次级模型或 overrides 引用的仍保留并提示。新模型插入到 ChatGPT 分组最前面。
+
 ## 0.1.1 — 2026-09-06
 
 - 配置校验器不可用、超时或拒绝候选配置时跳过写入；SessionStart 仍正常结束。Windows 支持通过命令解释器运行 `kimi.cmd`；Kimi 不可用时尝试 Python 3.11+ 的 TOML 校验。
